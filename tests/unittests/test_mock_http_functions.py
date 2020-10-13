@@ -22,8 +22,10 @@ class TestMockHost(testutils.AsyncTestCase):
             self.assertEqual(r.response.result.status,
                              protos.StatusResult.Success)
 
-            user_logs = [l for l in r.logs if l.category == 'my function']
-            self.assertEqual(len(user_logs), 1)
+            user_logs = [line for line in r.logs
+                         if line.category == 'my function']
+            # 2 log statements added (critical and error) in sync_logging
+            self.assertEqual(len(user_logs), 2)
 
             log = user_logs[0]
             self.assertEqual(log.invocation_id, invoke_id)
@@ -48,7 +50,8 @@ class TestMockHost(testutils.AsyncTestCase):
             self.assertEqual(r.response.result.status,
                              protos.StatusResult.Success)
 
-            user_logs = [l for l in r.logs if l.category == 'my function']
+            user_logs = [line for line in r.logs if
+                         line.category == 'my function']
             self.assertEqual(len(user_logs), 2)
 
             first_msg = user_logs[0]

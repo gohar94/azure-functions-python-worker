@@ -45,13 +45,53 @@ class TestLoader(testutils.WebHostTestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.text, '__app__.parentmodule.module')
 
-    def test_loader_brokenimplicit(self):
-        r = self.webhost.request('GET', 'brokenimplicit')
+    def test_loader_absolute_thirdparty(self):
+        """Allow third-party package import from .python_packages
+        and worker_venv
+        """
+
+        r = self.webhost.request('GET', 'absolute_thirdparty')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.text, 'eh = azure.eventhub')
+
+    def test_loader_prioritize_customer_module(self):
+        """When a module in customer code has the same name with a third-party
+        package, the worker should prioritize third-party package
+        """
+
+        r = self.webhost.request('GET', 'name_collision')
+        self.assertEqual(r.status_code, 200)
+        self.assertRegex(r.text, r'pt.__version__ = \d+.\d+.\d+')
+
+    def test_loader_fix_customer_module_with_app_import(self):
+        """When a module in customer code has the same name with a third-party
+        package, if customer uses "import __app__.<module>" statement,
+        the worker should load customer package
+        """
+
+        r = self.webhost.request('GET', 'name_collision_app_import')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.text, 'pt.__version__ = from.customer.code')
+
+    def test_loader_implicit_import(self):
+        """Since sys.path is now fixed with script root appended,
+        implicit import statement is now acceptable.
+        """
+
+        r = self.webhost.request('GET', 'implicit_import')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.text, 's_main = simple.main')
+
+    def test_loader_module_not_found(self):
+        """If a module cannot be found, should throw an exception with
+        trouble shooting link https://aka.ms/functions-modulenotfound
+        """
+        r = self.webhost.request('GET', 'module_not_found')
         self.assertEqual(r.status_code, 500)
 
-    def check_log_loader_brokenimplicit(self, host_out):
+    def check_log_loader_module_not_found(self, host_out):
         self.assertIn("Exception: ModuleNotFoundError: "
-                      "No module named 'simple'. "
+                      "No module named 'notfound'. "
                       "Troubleshooting Guide: "
                       "https://aka.ms/functions-modulenotfound", host_out)
 
@@ -70,20 +110,20 @@ class TestPluginLoader(testutils.AsyncTestCase):
         # This test must be run in a subprocess so that
         # pkg_resources picks up the newly installed package.
         code = textwrap.dedent('''
-        import asyncio
-        from azure_functions_worker import protos
-        from azure_functions_worker import testutils
+import asyncio
+from azure_functions_worker import protos
+from azure_functions_worker import testutils
 
-        async def _runner():
-            async with testutils.start_mockhost(
-                    script_root='unittests/test-binding/functions') as host:
-                func_id, r = await host.load_function('foo')
+async def _runner():
+    async with testutils.start_mockhost(
+            script_root='unittests/test-binding/functions') as host:
+        func_id, r = await host.load_function('foo')
 
-                print(r.response.function_id == func_id)
-                print(r.response.result.status == protos.StatusResult.Success)
+        print(r.response.function_id == func_id)
+        print(r.response.result.status == protos.StatusResult.Success)
 
-        asyncio.get_event_loop().run_until_complete(_runner())
-        ''')
+asyncio.get_event_loop().run_until_complete(_runner())
+''')
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -94,7 +134,7 @@ class TestPluginLoader(testutils.AsyncTestCase):
 
             # Trimming off carriage return charater when testing on Windows
             stdout_lines = [
-                l.replace(b'\r', b'') for l in stdout.strip().split(b'\n')
+                line.replace(b'\r', b'') for line in stdout.strip().split(b'\n')
             ]
             self.assertEqual(stdout_lines, [b'True', b'True'])
 

@@ -1,11 +1,14 @@
 {
     "scriptFile": "main.py",
-    "entryPoint": "customentry",
     "bindings": [
       {
+        "authLevel": "anonymous",
         "type": "httpTrigger",
         "direction": "in",
-        "name": "req"
+        "name": "req",
+        "methods": [
+          "get"
+        ]
       },
       {
         "type": "http",

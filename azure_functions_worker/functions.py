@@ -32,7 +32,7 @@ class FunctionInfo(typing.NamedTuple):
 
 class FunctionLoadError(RuntimeError):
 
-    def __init__(self, function_name, msg):
+    def __init__(self, function_name: str, msg: str) -> None:
         super().__init__(
             f'cannot load the {function_name} function: {msg}')
 
@@ -41,10 +41,10 @@ class Registry:
 
     _functions: typing.MutableMapping[str, FunctionInfo]
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._functions = {}
 
-    def get_function(self, function_id: str):
+    def get_function(self, function_id: str) -> FunctionInfo:
         try:
             return self._functions[function_id]
         except KeyError:
@@ -73,13 +73,13 @@ class Registry:
             if desc.direction == protos.BindingInfo.inout:
                 raise FunctionLoadError(
                     func_name,
-                    f'"inout" bindings are not supported')
+                    '"inout" bindings are not supported')
 
             if name == '$return':
                 if desc.direction != protos.BindingInfo.out:
                     raise FunctionLoadError(
                         func_name,
-                        f'"$return" binding must have direction set to "out"')
+                        '"$return" binding must have direction set to "out"')
 
                 has_explicit_return = True
                 return_binding_name = desc.type
@@ -104,14 +104,14 @@ class Registry:
                         or ctx_anno.__name__ != 'Context'):
                     raise FunctionLoadError(
                         func_name,
-                        f'the "context" parameter is expected to be of '
-                        f'type azure.functions.Context, got '
+                        'the "context" parameter is expected to be of '
+                        'type azure.functions.Context, got '
                         f'{ctx_anno!r}')
 
         if set(params) - set(bound_params):
             raise FunctionLoadError(
                 func_name,
-                f'the following parameters are declared in Python but '
+                'the following parameters are declared in Python but '
                 f'not in function.json: {set(params) - set(bound_params)!r}')
 
         if set(bound_params) - set(params):
@@ -180,15 +180,15 @@ class Registry:
                 raise FunctionLoadError(
                     func_name,
                     f'binding {param.name} is declared to have the "out" '
-                    f'direction, but its annotation in Python is not '
-                    f'a subclass of azure.functions.Out')
+                    'direction, but its annotation in Python is not '
+                    'a subclass of azure.functions.Out')
 
             if not is_binding_out and is_param_out:
                 raise FunctionLoadError(
                     func_name,
                     f'binding {param.name} is declared to have the "in" '
-                    f'direction in function.json, but its annotation '
-                    f'is azure.functions.Out in Python')
+                    'direction in function.json, but its annotation '
+                    'is azure.functions.Out in Python')
 
             if param_has_anno and param_py_type in (str, bytes) and (
                     not bindings.has_implicit_output(desc.type)):
@@ -233,7 +233,7 @@ class Registry:
                and typing_inspect.get_origin(return_anno).__name__ == 'Out'):
                 raise FunctionLoadError(
                     func_name,
-                    f'return annotation should not be azure.functions.Out')
+                    'return annotation should not be azure.functions.Out')
 
             return_pytype = return_anno
             if not isinstance(return_pytype, type):

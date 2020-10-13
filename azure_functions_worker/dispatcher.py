@@ -7,27 +7,43 @@ Implements loading and execution of Python workers.
 
 import asyncio
 import concurrent.futures
-import logging
-import queue
-import threading
-import os
-import sys
 import importlib
 import inspect
+import logging
+import os
+import queue
+import sys
+import threading
+from asyncio import BaseEventLoop
+from logging import LogRecord
+from typing import Optional
 
 import grpc
-import pkg_resources
 
 from . import bindings
+from . import constants
 from . import functions
 from . import loader
 from . import protos
-from . import constants
-
-from .logging import error_logger, logger, is_system_log_category
-from .logging import enable_console_logging, disable_console_logging
+from .constants import (CONSOLE_LOG_PREFIX, PYTHON_THREADPOOL_THREAD_COUNT,
+                        PYTHON_THREADPOOL_THREAD_COUNT_DEFAULT,
+                        PYTHON_THREADPOOL_THREAD_COUNT_MAX,
+                        PYTHON_THREADPOOL_THREAD_COUNT_MIN)
+from .logging import disable_console_logging, enable_console_logging
+from .logging import error_logger, is_system_log_category, logger
+from .utils.common import get_app_setting
 from .utils.tracing import marshall_exception_trace
 from .utils.wrappers import disable_feature_by
+
+_TRUE = "true"
+
+"""In Python 3.6, the current_task method was in the Task class, but got moved
+out in 3.7+ and fully removed in 3.9. Thus, to support 3.6 and 3.9 together, we
+need to switch the implementation of current_task for 3.6.
+"""
+_CURRENT_TASK = asyncio.Task.current_task \
+    if (sys.version_info[0] == 3 and sys.version_info[1] == 6) \
+    else asyncio.current_task
 
 
 class DispatcherMeta(type):
@@ -46,8 +62,10 @@ class Dispatcher(metaclass=DispatcherMeta):
 
     _GRPC_STOP_RESPONSE = object()
 
-    def __init__(self, loop, host, port, worker_id, request_id,
-                 grpc_connect_timeout, grpc_max_msg_len=-1):
+    def __init__(self, loop: BaseEventLoop, host: str, port: int,
+                 worker_id: str, request_id: str,
+                 grpc_connect_timeout: float,
+                 grpc_max_msg_len: int = -1) -> None:
         self._loop = loop
         self._host = host
         self._port = port
@@ -55,51 +73,39 @@ class Dispatcher(metaclass=DispatcherMeta):
         self._worker_id = worker_id
         self._functions = functions.Registry()
 
-        # A thread-pool for synchronous function calls.  We limit
-        # the number of threads to 1 so that one Python worker can
-        # only run one synchronous function in parallel.  This is
-        # because synchronous code in Python is rarely designed with
-        # concurrency in mind, so we don't want to allow users to
-        # have races in their synchronous functions.  Moreover,
-        # because of the GIL in CPython, it rarely makes sense to
-        # use threads (unless the code is IO bound, but we have
-        # async support for that.)
-        self._sync_call_tp = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1)
+        self._old_task_factory = None
 
-        self._grpc_connect_timeout = grpc_connect_timeout
+        # We allow the customer to change synchronous thread pool count by
+        # PYTHON_THREADPOOL_THREAD_COUNT app setting. The default value is 1.
+        self._sync_tp_max_workers: int = self._get_sync_tp_max_workers()
+        self._sync_call_tp: concurrent.futures.Executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._sync_tp_max_workers))
+
+        self._grpc_connect_timeout: float = grpc_connect_timeout
         # This is set to -1 by default to remove the limitation on msg size
-        self._grpc_max_msg_len = grpc_max_msg_len
+        self._grpc_max_msg_len: int = grpc_max_msg_len
         self._grpc_resp_queue: queue.Queue = queue.Queue()
         self._grpc_connected_fut = loop.create_future()
-        self._grpc_thread = threading.Thread(
+        self._grpc_thread: threading.Thread = threading.Thread(
             name='grpc-thread', target=self.__poll_grpc)
 
-    def load_bindings(self):
-        """Load out-of-tree binding implementations."""
-        services = {}
-
-        for ep in pkg_resources.iter_entry_points('azure.functions.bindings'):
-            logger.info('Loading binding plugin from %s', ep.module_name)
-            ep.load()
-
-        return services
-
     @classmethod
-    async def connect(cls, host, port, worker_id, request_id,
-                      connect_timeout):
-        loop = asyncio._get_running_loop()
-        disp = cls(loop, host, port, worker_id, request_id,
-                   connect_timeout)
+    async def connect(cls, host: str, port: int, worker_id: str,
+                      request_id: str, connect_timeout: float):
+        loop = asyncio.events.get_event_loop()
+        disp = cls(loop, host, port, worker_id, request_id, connect_timeout)
         disp._grpc_thread.start()
         await disp._grpc_connected_fut
-        logger.info('Successfully opened gRPC channel to %s:%s', host, port)
+        logger.info('Successfully opened gRPC channel to %s:%s '
+                    'with sync threadpool max workers set to %s',
+                    host, port, disp._sync_tp_max_workers)
         return disp
 
     async def dispatch_forever(self):
         if DispatcherMeta.__current_dispatcher__ is not None:
-            raise RuntimeError(
-                'there can be only one running dispatcher per process')
+            raise RuntimeError('there can be only one running dispatcher per '
+                               'process')
 
         self._old_task_factory = self._loop.get_task_factory()
 
@@ -118,22 +124,29 @@ class Dispatcher(metaclass=DispatcherMeta):
             self._loop.set_task_factory(
                 lambda loop, coro: ContextEnabledTask(coro, loop=loop))
 
-            # Attach gRPC logging to the root logger
+            # Detach console logging before enabling GRPC channel logging
+            logger.info('Detaching console logging.')
+            disable_console_logging()
+
+            # Attach gRPC logging to the root logger. Since gRPC channel is
+            # established, should use it for system and user logs
             logging_handler = AsyncLoggingHandler()
             root_logger = logging.getLogger()
-            root_logger.setLevel(logging.INFO)
+            root_logger.setLevel(logging.DEBUG)
             root_logger.addHandler(logging_handler)
-
-            # Since gRPC channel is established, should use it for logging
-            disable_console_logging()
-            logger.info('Detach console logging. Switch to gRPC logging')
+            logger.info('Switched to gRPC logging.')
+            logging_handler.flush()
 
             try:
                 await forever
             finally:
+                logger.warning('Detaching gRPC logging due to exception.')
+                logging_handler.flush()
+                root_logger.removeHandler(logging_handler)
+
                 # Reenable console logging when there's an exception
                 enable_console_logging()
-                root_logger.removeHandler(logging_handler)
+                logger.warning('Switched to console logging due to exception.')
         finally:
             DispatcherMeta.__current_dispatcher__ = None
 
@@ -142,7 +155,7 @@ class Dispatcher(metaclass=DispatcherMeta):
             self._loop.set_task_factory(self._old_task_factory)
             self.stop()
 
-    def stop(self):
+    def stop(self) -> None:
         if self._grpc_thread is not None:
             self._grpc_resp_queue.put_nowait(self._GRPC_STOP_RESPONSE)
             self._grpc_thread.join()
@@ -152,7 +165,7 @@ class Dispatcher(metaclass=DispatcherMeta):
             self._sync_call_tp.shutdown()
             self._sync_call_tp = None
 
-    def _on_logging(self, record: logging.LogRecord, formatted_msg: str):
+    def on_logging(self, record: logging.LogRecord, formatted_msg: str) -> None:
         if record.levelno >= logging.CRITICAL:
             log_level = protos.RpcLog.Critical
         elif record.levelno >= logging.ERROR:
@@ -167,9 +180,9 @@ class Dispatcher(metaclass=DispatcherMeta):
             log_level = getattr(protos.RpcLog, 'None')
 
         if is_system_log_category(record.name):
-            log_category = protos.RpcLog.RpcLogCategory.System
-        else:
-            log_category = protos.RpcLog.RpcLogCategory.User
+            log_category = protos.RpcLog.RpcLogCategory.Value('System')
+        else:  # customers using logging will yield 'root' in record.name
+            log_category = protos.RpcLog.RpcLogCategory.Value('User')
 
         log = dict(
             level=log_level,
@@ -194,19 +207,21 @@ class Dispatcher(metaclass=DispatcherMeta):
                 rpc_log=protos.RpcLog(**log)))
 
     @property
-    def request_id(self):
+    def request_id(self) -> str:
         return self._request_id
 
     @property
-    def worker_id(self):
+    def worker_id(self) -> str:
         return self._worker_id
 
-    def _serialize_exception(self, exc):
+    # noinspection PyBroadException
+    @staticmethod
+    def _serialize_exception(exc: Exception):
         try:
             message = f'{type(exc).__name__}: {exc}'
         except Exception:
-            message = (f'Unhandled exception in function. '
-                       f'Could not serialize original exception message.')
+            message = ('Unhandled exception in function. '
+                       'Could not serialize original exception message.')
 
         try:
             stack_trace = marshall_exception_trace(exc)
@@ -222,8 +237,8 @@ class Dispatcher(metaclass=DispatcherMeta):
             # Don't crash on unknown messages.  Some of them can be ignored;
             # and if something goes really wrong the host can always just
             # kill the worker's process.
-            logger.error(
-                f'unknown StreamingMessage content type {content_type}')
+            logger.error(f'unknown StreamingMessage content type '
+                         f'{content_type}')
             return
 
         resp = await request_handler(request)
@@ -233,12 +248,13 @@ class Dispatcher(metaclass=DispatcherMeta):
         logger.info('Received WorkerInitRequest, request ID %s',
                     self.request_id)
 
-        capabilities = dict()
-        capabilities[constants.RAW_HTTP_BODY_BYTES] = "true"
-        capabilities[constants.TYPED_DATA_COLLECTION] = "true"
-        capabilities[constants.RPC_HTTP_BODY_ONLY] = "true"
-        capabilities[constants.RPC_HTTP_TRIGGER_METADATA_REMOVED] = "true"
-        capabilities[constants.WORKER_STATUS] = "true"
+        capabilities = {
+            constants.RAW_HTTP_BODY_BYTES: _TRUE,
+            constants.TYPED_DATA_COLLECTION: _TRUE,
+            constants.RPC_HTTP_BODY_ONLY: _TRUE,
+            constants.RPC_HTTP_TRIGGER_METADATA_REMOVED: _TRUE,
+            constants.WORKER_STATUS: _TRUE
+        }
 
         return protos.StreamingMessage(
             request_id=self.request_id,
@@ -259,9 +275,9 @@ class Dispatcher(metaclass=DispatcherMeta):
         func_request = req.function_load_request
         function_id = func_request.function_id
 
-        logger.info('Received FunctionLoadRequest, request ID: %s, '
-                    'function ID: %s', self.request_id, function_id)
-
+        logger.info(f'Received FunctionLoadRequest, '
+                    f'request ID: {self.request_id}, '
+                    f'function ID: {function_id}')
         try:
             func = loader.load_function(
                 func_request.metadata.name,
@@ -273,8 +289,8 @@ class Dispatcher(metaclass=DispatcherMeta):
                 function_id, func, func_request.metadata)
 
             logger.info('Successfully processed FunctionLoadRequest, '
-                        'request ID: %s, function ID: %s',
-                        self.request_id, function_id)
+                        f'request ID: {self.request_id}, '
+                        f'function ID: {function_id}')
 
             return protos.StreamingMessage(
                 request_id=self.request_id,
@@ -303,18 +319,19 @@ class Dispatcher(metaclass=DispatcherMeta):
             invoc_request.trace_context.attributes)
         # Set the current `invocation_id` to the current task so
         # that our logging handler can find it.
-        current_task = asyncio.Task.current_task(self._loop)
+        current_task = _CURRENT_TASK(self._loop)
         assert isinstance(current_task, ContextEnabledTask)
         current_task.set_azure_invocation_id(invocation_id)
-
-        logger.info('Received FunctionInvocationRequest, request ID: %s, '
-                    'function ID: %s, invocation ID: %s',
-                    self.request_id, function_id, invocation_id)
 
         try:
             fi: functions.FunctionInfo = self._functions.get_function(
                 function_id)
 
+            logger.info(f'Received FunctionInvocationRequest, '
+                        f'request ID: {self.request_id}, '
+                        f'function ID: {function_id}, '
+                        f'invocation ID: {invocation_id}, '
+                        f'function type: {"async" if fi.is_async else "sync"}')
             args = {}
             for pb in invoc_request.input_data:
                 pb_type_info = fi.input_types[pb.name]
@@ -336,21 +353,14 @@ class Dispatcher(metaclass=DispatcherMeta):
                     args[name] = bindings.Out()
 
             if fi.is_async:
-                logger.info('Function is async, request ID: %s,'
-                            'function ID: %s, invocation ID: %s',
-                            self.request_id, function_id, invocation_id)
                 call_result = await fi.func(**args)
             else:
-                logger.info('Function is sync, request ID: %s,'
-                            'function ID: %s, invocation ID: %s',
-                            self.request_id, function_id, invocation_id)
                 call_result = await self._loop.run_in_executor(
                     self._sync_call_tp,
                     self.__run_sync_func, invocation_id, fi.func, args)
             if call_result is not None and not fi.has_return:
-                raise RuntimeError(
-                    f'function {fi.name!r} without a $return binding '
-                    f'returned a non-None value')
+                raise RuntimeError(f'function {fi.name!r} without a $return '
+                                   'binding returned a non-None value')
 
             output_data = []
             if fi.output_types:
@@ -377,9 +387,8 @@ class Dispatcher(metaclass=DispatcherMeta):
                     fi.return_type.binding_name, call_result,
                     pytype=fi.return_type.pytype)
 
-            logger.info('Successfully processed FunctionInvocationRequest, '
-                        'request ID: %s, function ID: %s, invocation ID: %s',
-                        self.request_id, function_id, invocation_id)
+            # Actively flush customer print() function to console
+            sys.stdout.flush()
 
             return protos.StreamingMessage(
                 request_id=self.request_id,
@@ -400,6 +409,8 @@ class Dispatcher(metaclass=DispatcherMeta):
                         exception=self._serialize_exception(ex))))
 
     async def _handle__function_environment_reload_request(self, req):
+        """Only runs on Linux Consumption placeholder specialization.
+        """
         try:
             logger.info('Received FunctionEnvironmentReloadRequest, '
                         'request ID: %s', self.request_id)
@@ -411,12 +422,16 @@ class Dispatcher(metaclass=DispatcherMeta):
             # customer use
             import azure.functions # NoQA
 
+            # Append function project root to module finding sys.path
+            if func_env_reload_request.function_app_directory:
+                sys.path.append(func_env_reload_request.function_app_directory)
+
+            # Clear sys.path import cache, reload all module from new sys.path
             sys.path_importer_cache.clear()
 
+            # Reload environment variables
             os.environ.clear()
-
             env_vars = func_env_reload_request.environment_variables
-
             for var in env_vars:
                 os.environ[var] = env_vars[var]
 
@@ -471,7 +486,29 @@ class Dispatcher(metaclass=DispatcherMeta):
             os.chdir(new_cwd)
             logger.info('Changing current working directory to %s', new_cwd)
         else:
-            logger.warn('Directory %s is not found when reloading', new_cwd)
+            logger.warning('Directory %s is not found when reloading', new_cwd)
+
+    def _get_sync_tp_max_workers(self) -> int:
+        def tp_max_workers_validator(value: str) -> bool:
+            try:
+                int_value = int(value)
+            except ValueError:
+                logger.warning(f'{PYTHON_THREADPOOL_THREAD_COUNT} must be an '
+                               'integer')
+                return False
+
+            if int_value < PYTHON_THREADPOOL_THREAD_COUNT_MIN or (
+               int_value > PYTHON_THREADPOOL_THREAD_COUNT_MAX):
+                logger.warning(f'{PYTHON_THREADPOOL_THREAD_COUNT} must be set '
+                               'to a value between 1 and 32')
+                return False
+
+            return True
+
+        return int(get_app_setting(
+            setting=PYTHON_THREADPOOL_THREAD_COUNT,
+            default_value=f'{PYTHON_THREADPOOL_THREAD_COUNT_DEFAULT}',
+            validator=tp_max_workers_validator))
 
     def __run_sync_func(self, invocation_id, func, params):
         # This helper exists because we need to access the current
@@ -529,38 +566,52 @@ class Dispatcher(metaclass=DispatcherMeta):
 
 class AsyncLoggingHandler(logging.Handler):
 
-    def emit(self, record):
-        # Since we disable console log after gRPC channel is initiated
-        # We should redirect all the messages into dispatcher
+    def emit(self, record: LogRecord) -> None:
+        # Since we disable console log after gRPC channel is initiated,
+        # we should redirect all the messages into dispatcher.
+
+        # When dispatcher receives an exception, it should switch back
+        # to console logging. However, it is possible that
+        # __current_dispatcher__ is set to None as there are still messages
+        # buffered in this handler, not calling the emit yet.
         msg = self.format(record)
-        Dispatcher.current._on_logging(record, msg)
+        try:
+            Dispatcher.current.on_logging(record, msg)
+        except RuntimeError as runtime_error:
+            # This will cause 'Dispatcher not found' failure.
+            # Logging such of an issue will cause infinite loop of gRPC logging
+            # To mitigate, we should suppress the 2nd level error logging here
+            # and use print function to report exception instead.
+            print(f'{CONSOLE_LOG_PREFIX} ERROR: {str(runtime_error)}',
+                  file=sys.stderr, flush=True)
 
 
 class ContextEnabledTask(asyncio.Task):
 
-    _AZURE_INVOCATION_ID = '__azure_function_invocation_id__'
+    AZURE_INVOCATION_ID = '__azure_function_invocation_id__'
 
     def __init__(self, coro, loop):
         super().__init__(coro, loop=loop)
 
-        current_task = asyncio.Task.current_task(loop)
+        current_task = _CURRENT_TASK(loop)
         if current_task is not None:
             invocation_id = getattr(
-                current_task, self._AZURE_INVOCATION_ID, None)
+                current_task, self.AZURE_INVOCATION_ID, None)
             if invocation_id is not None:
                 self.set_azure_invocation_id(invocation_id)
 
-    def set_azure_invocation_id(self, invocation_id):
-        setattr(self, self._AZURE_INVOCATION_ID, invocation_id)
+    def set_azure_invocation_id(self, invocation_id: str) -> None:
+        setattr(self, self.AZURE_INVOCATION_ID, invocation_id)
 
 
-def get_current_invocation_id():
+def get_current_invocation_id() -> Optional[str]:
     loop = asyncio._get_running_loop()
     if loop is not None:
-        current_task = asyncio.Task.current_task(loop)
+        current_task = _CURRENT_TASK(loop)
         if current_task is not None:
-            task_invocation_id = getattr(
-                current_task, ContextEnabledTask._AZURE_INVOCATION_ID, None)
+            task_invocation_id = getattr(current_task,
+                                         ContextEnabledTask.AZURE_INVOCATION_ID,
+                                         None)
             if task_invocation_id is not None:
                 return task_invocation_id
 

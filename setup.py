@@ -16,9 +16,12 @@ from setuptools import setup
 from setuptools.command import develop
 
 
-# TODO: change this to something more stable when available.
-WEBHOST_URL = ('https://ci.appveyor.com/api/buildjobs/19gqd7drpxhkedea'
-               '/artifacts/Functions.Binaries.2.0.13036.no-runtime.zip')
+# TODO: Change this to something more stable when available.
+# TODO: Change this to use 3.x
+WEBHOST_URL = (
+    "https://github.com/Azure/azure-functions-host/releases/download"
+    "/v2.0.14494/Functions.Binaries.2.0.14494.no-runtime.zip"
+)
 
 # Extensions necessary for non-core bindings.
 AZURE_EXTENSIONS = """\
@@ -195,9 +198,8 @@ class webhost(distutils.cmd.Command):
                 print('Downloading Azure Functions Web Host...')
                 urllib.request.urlretrieve(self.webhost_url, zipf.name)
             except Exception as e:
-                print(
-                    f"could not download Azure Functions Web Host binaries "
-                    f"from {self.webhost_url}: {e!r}", file=sys.stderr)
+                print(f"could not download Azure Functions Web Host binaries "
+                      f"from {self.webhost_url}: {e!r}", file=sys.stderr)
                 sys.exit(1)
 
             if not self.webhost_dir.exists():
@@ -257,19 +259,27 @@ with open("README.md") as readme:
 
 setup(
     name='azure-functions-worker',
-    version='1.1.1',
+    version='1.1.6',
     description='Python Language Worker for Azure Functions Host',
+    author="Microsoft Corp.",
+    author_email="azurefunctions@microsoft.com",
+    keywords="azure azurefunctions python",
+    url="http://packages.python.org/an_example_pypi_project",
     long_description=long_description,
     long_description_content_type='text/markdown',
     classifiers=[
+        'Development Status :: 5 - Production/Stable',
         'License :: OSI Approved :: MIT License',
         'Intended Audience :: Developers',
         'Programming Language :: Python :: 3',
+        "Programming Language :: Python :: 3.6",
+        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
         'Operating System :: Microsoft :: Windows',
         'Operating System :: POSIX',
         'Operating System :: MacOS :: MacOS X',
         'Environment :: Web Environment',
-        'Development Status :: 5 - Production/Stable',
     ],
     license='MIT',
     packages=['azure_functions_worker',
@@ -280,17 +290,25 @@ setup(
               'azure_functions_worker.utils',
               'azure_functions_worker._thirdparty'],
     install_requires=[
-        'grpcio~=1.26.0',
-        'grpcio-tools~=1.26.0',
+        'grpcio~=1.32.0',
+        'grpcio-tools~=1.32.0',
     ],
     extras_require={
         'dev': [
-            'azure-functions==1.2.1',
+            'azure-functions==1.4.0',
+            'azure-eventhub~=5.1.0',
+            'python-dateutil~=2.8.1',
             'flake8~=3.7.9',
             'mypy',
             'pytest',
             'requests==2.*',
-            'coverage'
+            'coverage',
+            'pytest-sugar',
+            'pytest-cov',
+            'pytest-xdist',
+            'pytest-randomly',
+            'pytest-instafail',
+            'pytest-rerunfailures'
         ]
     },
     include_package_data=True,

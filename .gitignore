@@ -84,7 +84,7 @@ celerybeat-schedule
 
 # virtualenv (.venv/.venv36/.venv37/.venv38)
 .venv*
-venv/
+venv*/
 ENV/
 py3env/
 
@@ -119,3 +119,6 @@ py3env/
 # PyCharm
 .idea/
 .idea_modules/
+
+# Profiling info
+prof/
