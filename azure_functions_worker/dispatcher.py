@@ -346,6 +346,12 @@ class Dispatcher(metaclass=DispatcherMeta):
             if fi.is_async:
                 call_result = await fi.func(**args)
             else:
+                logger.info(f'Processing FunctionInvocationRequest, '
+                            f'request ID: {self.request_id}, '
+                            f'function ID: {function_id}, '
+                            f'invocation ID: {invocation_id}, '
+                            f'function type: '
+                            f'{"async" if fi.is_async else "sync"}')
                 call_result = await self._loop.run_in_executor(
                     self._sync_call_tp,
                     self.__run_sync_func, invocation_id, fi.func, args)
@@ -380,6 +386,12 @@ class Dispatcher(metaclass=DispatcherMeta):
 
             # Actively flush customer print() function to console
             sys.stdout.flush()
+
+            logger.info(f'Completed FunctionInvocationRequest, '
+                        f'request ID: {self.request_id}, '
+                        f'function ID: {function_id}, '
+                        f'invocation ID: {invocation_id}, '
+                        f'function type: {"async" if fi.is_async else "sync"}')
 
             return protos.StreamingMessage(
                 request_id=self.request_id,
