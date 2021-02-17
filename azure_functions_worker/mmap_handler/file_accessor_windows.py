@@ -24,8 +24,9 @@ class FileAccessorWindows(FileAccessor):
     def create_mem_map(self, map_name: str, map_size: int) -> Optional[mmap.mmap]:
         # Windows also creates the mmap when trying to open it, if it does not already exist.
         mem_map = self.open_mem_map(map_name, map_size, mmap.ACCESS_WRITE)
-        if not self._verify_new_map_created(map_name, mem_map):
+        if self._is_dirty_bit_set(map_name, mem_map):
             raise Exception("Memory map '%s' already exists" % (map_name))
+        self._set_dirty_bit(map_name, mem_map)
         return mem_map
 
     def delete_mem_map(self, map_name: str, mmap) -> bool:

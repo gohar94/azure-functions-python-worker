@@ -41,16 +41,24 @@ class FileAccessor(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
-    def _verify_new_map_created(self, map_name: str, mem_map) -> bool:
-        """Checks if the first byte of the memory map is zero.
-        If it is not, this memory map already existed.
+    def _is_dirty_bit_set(self, map_name: str, mem_map) -> bool:
+        """
+        Checks if the dirty bit of the memory map has been set or not.
         """
         mem_map.seek(0)
         byte_read = mem_map.read(1)
-        is_new_mmap = False
-        if byte_read != consts.ZERO_BYTE:
-            is_new_mmap = False
+        if byte_read == consts.DIRTY_BIT_SET:
+            is_set = True
         else:
-            is_new_mmap = True
+            is_set = False
         mem_map.seek(0)
-        return is_new_mmap
+        return is_set
+
+    def _set_dirty_bit(self, map_name: str, mem_map):
+        """
+        Sets the dirty bit in the header of the memory map to indicate that this memory map is not
+        new anymore.
+        """
+        mem_map.seek(0)
+        mem_map.write(consts.DIRTY_BIT_SET)
+        mem_map.seek(0)

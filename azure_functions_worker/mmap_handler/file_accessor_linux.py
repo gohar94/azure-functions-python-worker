@@ -28,8 +28,9 @@ class FileAccessorLinux(FileAccessor):
     def create_mem_map(self, map_name: str, map_size: int) -> Optional[mmap.mmap]:
         fd = self._create_mem_map_file(map_name, map_size)
         mem_map = mmap.mmap(fd, map_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
-        if not self._verify_new_map_created(map_name, mem_map):
+        if self._is_dirty_bit_set(map_name, mem_map):
             raise Exception("Memory map '%s' already exists" % (map_name))
+        self._set_dirty_bit(map_name, mem_map)
         return mem_map
 
     def delete_mem_map(self, map_name: str, mem_map: mmap.mmap) -> bool:
